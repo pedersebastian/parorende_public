@@ -1,0 +1,534 @@
+---
+date: now
+lang: nb-NO
+format:
+  html:
+    format:
+    theme: [cosmo, extra_theme.scss]
+    code-tools: true
+    toc: true
+    toc-title: Innholdfortengelse 
+    toc-location: left
+    smooth-scroll: true
+    fig-align: center
+    self-contained: false
+    highlight-style: github
+    lightbox: true
+    echo: false
+---
+
+
+
+```{r imports}
+#| echo: false
+#| output: false
+library(tidyverse)
+library(readxl)
+library(gt)
+library(gtsummary)
+library(rlang)
+library(patchwork)
+
+source("helpr.R")
+source("ggplot2_theme.R")
+
+ggplot2::update_geom_defaults("rect", list(fill = "#1d3557", alpha = 0.9))
+ggplot2::update_geom_defaults("point", list(color = "#1d3557", alpha = 0.9))
+ggplot2::theme_set(pederlib::theme_center())
+theme_gtsummary_language(language = "no")
+
+seksjon <- "Generell intensiv 2, RH"
+```
+
+# Oppsummering pårørende undersøkelse for `r seksjon`
+```{r set up}
+# Fjerner -1 for at de skal bli NA. Ikke aktuelt blir fjernet senere
+# Kodeboken er som dette:
+
+# tribble(
+#   ~Variabelnavn,	~Visningstekst,	~'Unik teknisk referanse',	~'Mulige verdier',
+#   "BehandlingHoeflighetRespektMedfoelelse_2",	'1. Omtanke og omsorg fra intensivpersonalet? Den høflighet, respekt og medfølelse som ble vist ditt familiemedlem (pasienten)',	'BehandlingHoeflighetRespektMedfoelelse_2',	'-1 = Velg verdi, 1 = Totalt misfornøyd (1), 2 = Litt misfornøyd (2), 3 = For det meste fornøyd (3), 4 = Svært fornøyd (4), 5 = Totalt fornøyd (5), 6 = Ikke aktuelt'
+# )
+
+code_book <-
+  read_delim("kodebok.csv", delim = ";", skip = 1, show_col_types = FALSE) |>
+  janitor::clean_names() |>
+  filter(!is.na(mulige_verdier), variabelnavn != "HoeyesteFullfoerteUtdannelse") |>
+  select(-unik_teknisk_referanse, -c(felttype:gyldig_fra_og_med_skjemaversjon)) |>
+  separate_longer_delim(mulige_verdier, delim = ", ") |>
+  separate_wider_delim(mulige_verdier, delim = " = ", names = c("value", "text")) |>
+  mutate(value = parse_number(value)) |>
+  select(-visningstekst) |>
+  filter(value > 0) |>
+  mutate(
+    text = str_remove_all(text, " \\(.*$"),
+    text = if_else(text == "Ikke aktuelt", NA_character_, text),
+    text = str_wrap(text, width = 50)
+  )
+
+
+## Er ikke på gh selvfølgelig
+raw_data <- readxl::read_excel("kun_FS-ICU24R_ utenID..xlsx", na = "-1")
+
+case_whens_fun <-
+  code_book |>
+  mutate(variabelnavn_2 = variabelnavn) |>
+  group_by(variabelnavn_2) |>
+  nest(data = c(variabelnavn:text)) |>
+  mutate(fun = map2(data, variabelnavn_2, generate_case_when_function)) |>
+  ungroup()
+
+
+
+# exec case_when statement på alle variablene og lage de til faktor. Deretter sammenkoble de og lage score-variablene etter
+# https://fsicu.org/wp-content/uploads/FS-ICU24R-Scoring-Instructions-.pdf
+# Delscore og totalscore er sammenliknet med den som er generert av NIR
+
+quest_df <-
+  map(case_whens_fun$variabelnavn_2, exec_case_when_custom) |>
+  bind_cols() |>
+  mutate(across(case_whens_fun$variabelnavn_2, \(x) (x - 1) * 25, .names = "{.col}_score"))
+
+
+
+cleaned_data <-
+  raw_data |>
+  select(-where(is_logical), -all_of(case_whens_fun$variabelnavn_2), -contains("Skaaring")) |>
+  bind_cols(quest_df) |>
+  mutate(
+    HoeyesteFullfoerteUtdannelse_text = case_when(
+      HoeyesteFullfoerteUtdannelse == 0 ~ "Fullførte ikke grunnskole eller videregående skole",
+      HoeyesteFullfoerteUtdannelse == 1 ~ "Fullførte grunnskole og videregående skole",
+      HoeyesteFullfoerteUtdannelse == 2 ~ "Har tatt noe universitetsutdanning eller har fullført en form
+        for yrkesutdanning eller videreutdanning (for eksempel handel, tekniske fag eller yrkesrettet skole)",
+      HoeyesteFullfoerteUtdannelse == 3 ~ "Universitetsgrad (Bachelorgrad)",
+      HoeyesteFullfoerteUtdannelse == 4 ~ "Master eller Doktorgrad (MSc, PhD)",
+      TRUE ~ NA_character_
+    ),
+    ShNavn = case_when(
+      ShNavn == "RH Gen Int 1" ~ "Generell intensiv 1, RH",
+      ShNavn == "RH Gen Int 2" ~ "Generell intensiv 2, RH",
+      ShNavn == "Ullevål Postop" ~ "Postoperativ, UL",
+      ShNavn == "Ullevål Gen int" ~ "Generell intensiv, UL",
+      ShNavn == "Ullevål Nevroint" ~ "Nevrointensiv, UL",
+      ShNavn == "RH Barneintensiv" ~ "Barneintensiv, RH",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  rename(
+    "BeslutningTot" = SumScoreSatisfactionDecision_2,
+    "OmsorgTot" = SumScoreSatisfactionCare_2,
+    "FSICU_total" = SumScoreAllQuestions_2
+  )
+
+##
+fct_lvl <-
+  cleaned_data |>
+  select(all_of(c(Del1_text, Del2_text))) |>
+  mutate(across(everything(), \(x) str_c(levels(x), sep = ",", collapse = ","))) |>
+  head(1) |>
+  pivot_longer(everything(), names_to = "spørsmål_text", values_to = "fct_lvl")
+
+## tibble som kan brukes som oppslag for gruppe og "langt" navn
+meta_df <-
+  tibble(spørsmål_text = c(Del1_text, Del2_text)) |>
+  mutate(
+    spørsmål = str_remove(spørsmål_text, "_text"),
+    gruppe = case_when(
+      str_detect(spørsmål, "Symptom") ~ "Symptombehandling",
+      spørsmål %in% c(
+        "BehandlingSamarbeid_2",
+        "BehandlingBesvarerBeho_2v",
+        "BehandlingBesvarerStoette_2",
+        "BehandlingBesvarerHoeflighetRespektMedfoelelse_2"
+      ) ~ "Hvordan behandlet vi deg?",
+      spørsmål == "BehandlingHoeflighetRespektMedfoelelse_2" ~ "Hvordan behandlet vi pasienten?",
+      spørsmål == "AtmosfaerenPaaroerenderom_2" ~ "Venterommet",
+      spørsmål %in% c(
+        "AtmosfaerenIntensivAvd_2",
+        "OmfangetAvBehandlingen_2",
+        "DeltagelseIOmsorg",
+        "MengdenAvHelsetjenester"
+      ) ~ "Intensivavdelingen",
+      spørsmål %in% c(
+        "InformasjonsAerlighet_2",
+        "InformasjonsOverensstemmelse_2",
+        "InformasjonOmForloep_2",
+        "ForklaringForstaaelse_2",
+        "SvarPaaSpoersmaal_2",
+        "LegeInformasjonFrekvens_2"
+      ) ~ "Behov for informasjon",
+      spørsmål %in% c("LegeBehandling_2", "SykepleierKommunikasjon_2", "SykepleierOmsorg_2") ~ "Intensivpersonalet",
+      str_detect(spørsmål, "Beslutnings") ~ "Beslutningsinnvolvering",
+      str_detect(spørsmål, "Livs") ~ "Spørsmål der pasienten døde",
+      TRUE ~ "feil"
+    ),
+    spørsmål_lang = map_chr(spørsmål, fix_variable_name)
+  ) |>
+  left_join(fct_lvl, by = join_by(spørsmål_text)) |>
+  mutate(
+    del = if_else(spørsmål %in% Del1, "Del1", "Del2"),
+    row_nbr = row_number(),
+    bokstav = map_chr(row_nbr, \(x) get_letter(x))
+  )
+
+
+
+mors_data <-
+  cleaned_data |>
+  summarise(mors_count = sum(!is.na(LivsLengde_2_text)), .by = "ShNavn") |>
+  janitor::adorn_totals()
+```
+
+
+
+```{r}
+all_tables <- function(.data, seksjon_name) {
+  cleaned_data |>
+    select(
+      ShNavn, Kjoenn_text, PasientRelasjon_text, IntensivAvdelingInvolvertFoer_text, BorMedPasienten_text, HvorOfteSerDuPasienten_text,
+      DaysAdmittedIntensiv:Respirator, Alder, ShNavn, OmsorgTot:FSICU_total, -AgeAdmitted
+    ) |>
+    rename(
+      "Kjønn" = Kjoenn_text,
+      "Pasientrelasjon" = PasientRelasjon_text,
+      "Innlagt på intensiv før?" = IntensivAvdelingInvolvertFoer_text,
+      "Bor pårørende med pasienten?" = BorMedPasienten_text,
+      "Hvor ofte ser du pasienten?" = HvorOfteSerDuPasienten_text,
+      "Respirator, dager" = Respirator,
+      "Total FSICU" = FSICU_total,
+      "Total omsorgsdel" = OmsorgTot,
+      "Total beslutningsdel" = BeslutningTot,
+      "Dager innlagt" = DaysAdmittedIntensiv,
+    ) |>
+    mutate(
+      comp = if_else(ShNavn == seksjon_name, seksjon_name, "De andre seksjonene"),
+      comp = factor(comp, levels = c(seksjon_name, "De andre seksjonene"))
+    ) |>
+    select(-ShNavn) |>
+    tbl_summary(by = comp, percent = "column", missing = "no") |>
+    add_p() |>
+    add_overall() |>
+    bold_p() |>
+    bold_labels() |>
+    as_gt() |>
+    tab_header("Deskriptiv statistikk", subtitle = glue::glue("{seksjon_name} sammenliknet med de andre."))
+}
+
+all_tables(RegData, seksjon_name = seksjon)
+```
+
+
+```{r}
+plot_helper <- function(.data, group) {
+  pal <- c("#264653", "#2a9d8f", "#e9c46a", "#f4a261", "#e76f51")
+  data <- .data |>
+    count(spørsmål_lang, values) |>
+    mutate(values = fct_rev(values))
+
+  if (group == "Spørsmål der pasienten døde") {
+    data <- na.omit(data)
+  }
+
+  p <- data |>
+    ggplot(aes(x = n, y = spørsmål_lang, fill = values)) +
+    geom_col(show.legend = TRUE) +
+    guides("fill" = guide_legend(nrow = 5, title = NULL, position = "right", reverse = TRUE)) +
+    scale_fill_manual(values = pal, na.value = "gray80", drop = FALSE, na.translate = FALSE) +
+    labs(x = "Antall", y = NULL) +
+    scale_y_discrete(labels = scales::label_wrap(45)) +
+    theme(
+      axis.text.y = element_text(face = "bold", lineheight = rel(1.2), size = rel(1.6)),
+      legend.text = element_text(size = rel(0.9))
+    )
+  return(p)
+}
+```
+
+
+```{r}
+plot_group_factor <- function(.data, group, seksjon_name = NULL, remove_y = FALSE) {
+  pal <- c("#264653", "#2a9d8f", "#e9c46a", "#f4a261", "#e76f51")
+
+
+  spm <-
+    meta_df |>
+    filter(gruppe == {{ group }}) |>
+    pull(spørsmål_text)
+  data <-
+    select(.data, ShNavn, all_of(spm))
+
+
+  if (!is.null(seksjon_name)) {
+    mors <- mors_data$mors_count[mors_data == seksjon_name]
+
+    data <-
+      data |>
+      filter(ShNavn == {{ seksjon_name }})
+
+    subtitle <- glue::glue("Inkluderer data kun fra {seksjon_name}")
+  } else {
+    subtitle <- "Inkluderer data fra alle seksjoner"
+    mors <- mors_data$mors_count[mors_data == "Total"]
+  }
+
+  if (group == "Beslutningsinnvolvering") {
+    data <- data |>
+      select(-ShNavn) |>
+      nest(
+        BeslutningsInvolvering_2_text = BeslutningsInvolvering_2_text,
+        BeslutningsKontroll_2_text = BeslutningsKontroll_2_text,
+        BeslutningsTid_2_text = BeslutningsTid_2_text,
+        BeslutningsStoette_2_text = BeslutningsStoette_2_text
+      ) |>
+      pivot_longer(everything(), names_to = "spørsmål_text", values_to = "values") |>
+      left_join(meta_df, by = join_by(spørsmål_text))
+
+    p <-
+      map2(data$values, data$spørsmål_lang, \(x, y) rename(x, !!y := 1)) |>
+      map(\(x) pivot_longer(x, everything(), names_to = "spørsmål_lang", values_to = "values")) |>
+      map(\(x, y) plot_helper(x, "Beslutningsinnvolvering")) |>
+      patchwork::wrap_plots(ncol = 1, guides = "collect") + plot_annotation(
+        title = "Beslutningsstøtte",
+        subtitle = subtitle
+      )
+
+
+    return(p)
+  } else if (group == "Spørsmål der pasienten døde") {
+    subtitle <- paste0(subtitle, "\nAntall dødsfall: ", mors)
+
+    data <-
+      data |>
+      select(-ShNavn) |>
+      nest(
+        LivsLengde_2_text = LivsLengde_2_text,
+        LivssluttKomfor_2_text = LivssluttKomfor_2_text,
+        LivssluttStoette_2_text = LivssluttStoette_2_text
+      ) |>
+      pivot_longer(everything(), names_to = "spørsmål_text", values_to = "values") |>
+      left_join(meta_df, by = join_by(spørsmål_text))
+
+
+    p <-
+      map2(data$values, data$spørsmål_lang, \(x, y) rename(x, !!y := 1)) |>
+      map(\(x) pivot_longer(x, everything(), names_to = "spørsmål_lang", values_to = "values")) |>
+      map(\(x)plot_helper(x, "Spørsmål der pasienten døde")) |>
+      patchwork::wrap_plots(ncol = 1, guides = "collect") + plot_annotation(
+        title = "Spørsmål der pasienten døde",
+        subtitle = subtitle
+      )
+
+    return(p)
+  } else {
+    new_data <-
+      data |>
+      pivot_longer(-ShNavn, names_to = "spørsmål_text", values_to = "values") |>
+      na.omit() |>
+      left_join(meta_df, by = join_by(spørsmål_text)) |>
+      count(spørsmål_lang, values) |>
+      mutate(values = fct_rev(values))
+
+    p <- new_data |>
+      ggplot(aes(x = n, y = spørsmål_lang, fill = values)) +
+      geom_col(show.legend = TRUE, width = 0.7) +
+      guides("fill" = guide_legend(nrow = 2, title = NULL, position = "top", reverse = TRUE)) +
+      scale_fill_manual(values = pal, na.value = "gray80", drop = FALSE, na.translate = FALSE) +
+      labs(x = "Antall", y = NULL, title = paste0("Kategori: ", group), subtitle = subtitle) +
+      scale_y_discrete(labels = scales::label_wrap(45)) +
+      theme(
+        plot.subtitle = element_text(size = rel(0.9)),
+        axis.text.y = element_text(face = "bold", lineheight = rel(1.2), size = rel(1.2))
+      )
+
+    if (remove_y) {
+      p <- p + theme(axis.text.y = element_blank())
+    }
+  }
+
+  return(p)
+}
+```
+
+# Figurer
+
+## Del 1
+
+:::{.column-page}
+```{r}
+#| echo: false
+#| fig-width: 15
+#| fig-height: 8
+
+plot_group_factor(cleaned_data, "Hvordan behandlet vi pasienten?", seksjon) + plot_group_factor(cleaned_data, "Hvordan behandlet vi pasienten?", remove_y = TRUE)
+```
+
+```{r}
+#| echo: false
+#| fig-width: 15
+#| fig-height: 8
+plot_group_factor(cleaned_data, "Symptombehandling", seksjon) +
+  plot_group_factor(cleaned_data, "Symptombehandling", remove_y = TRUE)
+```
+
+
+```{r}
+#| echo: false
+#| fig-width: 15
+#| fig-height: 8
+plot_group_factor(cleaned_data, "Hvordan behandlet vi deg?", seksjon) +
+  plot_group_factor(cleaned_data, "Hvordan behandlet vi deg?", remove_y = TRUE)
+```
+
+
+```{r}
+#| echo: false
+#| fig-width: 15
+#| fig-height: 8
+plot_group_factor(cleaned_data, "Intensivpersonalet", seksjon) +
+  plot_group_factor(cleaned_data, "Intensivpersonalet", remove_y = TRUE)
+```
+
+
+```{r}
+#| echo: false
+#| fig-width: 15
+#| fig-height: 8
+plot_group_factor(cleaned_data, "Venterommet", seksjon) +
+  plot_group_factor(cleaned_data, "Venterommet", remove_y = TRUE)
+```
+
+
+```{r}
+#| echo: false
+#| fig-width: 15
+#| fig-height: 8
+plot_group_factor(cleaned_data, "Intensivavdelingen", seksjon) +
+  plot_group_factor(cleaned_data, "Intensivavdelingen", remove_y = TRUE)
+```
+
+
+```{r}
+#| echo: false
+#| fig-width: 15
+#| fig-height: 8
+plot_group_factor(cleaned_data, "Behov for informasjon", seksjon) +
+  plot_group_factor(cleaned_data, "Behov for informasjon", remove_y = TRUE)
+```
+
+## Del 2
+```{r}
+#| echo: false
+#| fig-width: 15
+#| fig-height: 8
+plot_group_factor(cleaned_data, "Beslutningsinnvolvering", seksjon)
+```
+:::
+:::{.column-page}
+
+```{r}
+#| echo: false
+#| fig-width: 15
+#| fig-height: 8
+plot_group_factor(cleaned_data, "Beslutningsinnvolvering")
+```
+:::
+
+:::{.column-page}
+```{r}
+#| echo: false
+#| fig-width: 15
+#| fig-height: 8
+plot_group_factor(cleaned_data, "Spørsmål der pasienten døde", seksjon)
+```
+:::
+
+:::{.column-page}
+```{r}
+#| echo: false
+#| fig-width: 15
+#| fig-height: 8
+plot_group_factor(cleaned_data, "Spørsmål der pasienten døde")
+```
+:::
+
+
+```{r}
+numvars <-
+  cleaned_data |>
+  select(all_of(c(Del1, Del2[1:10])))
+colors <- c(
+  "indianred3",
+  "white", "midnightblue"
+)
+library(corrr)
+cor_df <-
+  numvars |>
+  correlate(quiet = TRUE) |>
+  shave() |>
+  pivot_longer(-term, names_to = "y_names", values_to = "cor") |>
+  rename("spørsmål" = term) |>
+  left_join(select(meta_df, spørsmål, gruppe, spørsmål_lang, bokstav), join_by("spørsmål")) |>
+  rename("term" = spørsmål, "gruppe_term" = gruppe, "spørsmål_lang_term" = spørsmål_lang, "bokstav_term" = bokstav, "spørsmål" = y_names) |>
+  left_join(select(meta_df, spørsmål, gruppe, spørsmål_lang, bokstav), join_by("spørsmål"))
+
+p <-
+  cor_df |>
+  mutate(
+    spørsmål_lang_term = factor(spørsmål_lang_term, levels = rev(meta_df$spørsmål_lang)),
+    lbl = round(cor, 2)
+  ) |>
+  ggplot(aes(bokstav, bokstav_term, fill = cor, label = lbl)) +
+  geom_tile() +
+  geom_text(size = 1.4, na.rm = TRUE) +
+  scale_fill_gradientn(limits = c(
+    -1,
+    1
+  ), colors = colors, na.value = NA) +
+  theme(axis.text.x = element_text(angle = 0, size = rel(0.8), hjust = 0.5), panel.grid = element_blank()) +
+  scale_y_discrete(labels = scales::label_wrap(30)) +
+  labs(x = NULL, y = NULL, fill = "Korrelasjon")
+```
+
+
+```{r}
+lookup_tbl <-
+  meta_df |>
+  select(bokstav, spørsmål_lang) |>
+  filter(row_number() < 26) |>
+  mutate(spørsmål_lang = str_wrap(spørsmål_lang, 20)) |>
+  gt() |>
+  tab_style(
+    style = cell_text(
+      size = "x-small"
+    ),
+    locations = list(cells_body(columns = 2))
+  ) |>
+  tab_style(
+    style = cell_text(
+      size = "medium", weight = "bolder"
+    ),
+    locations = list(cells_body(columns = 1))
+  ) |>
+  tab_options(column_labels.hidden = TRUE) |>
+  text_transform(\(x)str_wrap(x, 10), cells_body(2)) |>
+  cols_width(2 ~ px(300)) |>
+  cols_align(align = "center") |>
+  tab_header("Oppslag")
+```
+## Korrelasjon med de ulike spørsmålene
+
+```{r}
+#| column: margin
+
+lookup_tbl
+```
+
+
+
+:::{.column-screen-inset-left}
+```{r}
+p
+```
+
+:::
